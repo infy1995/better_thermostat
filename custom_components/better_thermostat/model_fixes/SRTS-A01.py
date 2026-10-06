@@ -5,7 +5,10 @@ from __future__ import annotations
 import logging
 
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
+
+from ..utils.helpers import is_sibling_entry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -71,10 +74,17 @@ _TK_EXTERNAL_TEMP = frozenset({"external_temperature_input", "external_temperatu
 # the SRTS-A01 regulates on.
 _TK_SENSOR_SELECT = frozenset({"sensor_select", "sensor"})
 
-# The option that hands regulation to the value BT writes. Devices offer more
-# than one option naming an external sensor, so the ones already on such an
-# option are left as their owner set them.
-_EXTERNAL_SENSOR_OPTION = "external"
+# The option that hands regulation to the value BT writes. Zigbee2MQTT exposes
+# the SRTS-A01 ``sensor`` enum with exactly two values, ``internal`` and
+# ``external``. Kept as a tuple, like in the TRVZB quirk, so a future rename
+# only needs one more entry here.
+_EXTERNAL_SENSOR_OPTIONS = ("external",)
+
+# Selections that already regulate on the external input. A device on any of
+# them is left as its owner set it.
+_ON_A_REMOTE_SENSOR = ("external",)
+
+
 
 
 def _find_device_entity(
@@ -97,7 +107,7 @@ def _find_device_entity(
     device_id : str | None
         The device the sibling has to belong to. ``None`` is no device and
         matches nothing: every entity that belongs to no device would
-        otherwise be a candidate.
+        otherwise be a candidate. A disabled entry is no sibling either.
     domain : str
         The entity domain to search, ``number`` or ``select`` here.
     translation_keys : frozenset[str]
@@ -113,12 +123,10 @@ def _find_device_entity(
         match when no entry carries one of the keys, or ``None`` when the
         device has no such entity.
     """
-    if device_id is None:
-        return None
     siblings = [
         ent
         for ent in entity_registry.entities.values()
-        if ent.device_id == device_id and ent.domain == domain
+        if is_sibling_entry(ent, device_id) and ent.domain == domain
     ]
     for ent in siblings:
         if getattr(ent, "translation_key", None) in translation_keys:
@@ -187,22 +195,30 @@ async def maybe_select_external_sensor(self, entity_id: str) -> bool:
         # A selector that is not reporting names no option, and the device
         # behind it is in no state to take one either.
         return False
-    if str(state.state).startswith(_EXTERNAL_SENSOR_OPTION):
+    if str(state.state).startswith(_ON_A_REMOTE_SENSOR):
         return True
     options = state.attributes.get("options")
-    if not isinstance(options, (list, tuple)) or _EXTERNAL_SENSOR_OPTION not in options:
+    option = next(
+        (
+            name
+            for name in _EXTERNAL_SENSOR_OPTIONS
+            if isinstance(options, (list, tuple)) and name in options
+        ),
+        None,
+    )
+    if option is None:
         _LOGGER.debug(
-            "better_thermostat %s: SRTS-A01 selector %s offers no '%s' option (%s)",
+            "better_thermostat %s: SRTS-A01 selector %s offers none of %s (%s)",
             self.device_name,
             target,
-            _EXTERNAL_SENSOR_OPTION,
+            _EXTERNAL_SENSOR_OPTIONS,
             options,
         )
         return False
     await self.hass.services.async_call(
         "select",
         "select_option",
-        {"entity_id": target, "option": _EXTERNAL_SENSOR_OPTION},
+        {"entity_id": target, "option": option},
         blocking=True,
         context=self.context,
     )
@@ -211,7 +227,7 @@ async def maybe_select_external_sensor(self, entity_id: str) -> bool:
         self.device_name,
         target,
         state.state,
-        _EXTERNAL_SENSOR_OPTION,
+        option,
         entity_id,
     )
     return True
@@ -239,7 +255,8 @@ async def maybe_set_external_temperature(self, entity_id, temperature: float) ->
     -------
     bool
         True when the input was written, False when the device is not a
-        SRTS-A01, names no such input, or the value is not a number.
+        SRTS-A01, names no such input, the value is not a number, or the
+        device refused the write.
     """
     try:
         model = str(self.real_trvs[entity_id].model or "")
@@ -306,10 +323,23 @@ async def maybe_set_external_temperature(self, entity_id, temperature: float) ->
         # that is regulating on it.
         await maybe_select_external_sensor(self, entity_id)
         return True
-    except (TypeError, ValueError, KeyError, AttributeError) as ex:
-        _LOGGER.debug(
-            "better_thermostat %s: SRTS-A01 maybe_set_external_temperature exception: %s",
+    except (
+        HomeAssistantError,
+        OSError,
+        TypeError,
+        ValueError,
+        KeyError,
+        AttributeError,
+    ) as ex:
+        # The device did not take the value: it is asleep, out of reach, its
+        # integration is reloading, or it declares a narrower range than the
+        # clamp above. Reporting the refused write as a declined one leaves
+        # the caller free to serve the remaining TRVs and to control on the
+        # new reading; the next write retries.
+        _LOGGER.warning(
+            "better_thermostat %s: SRTS-A01 external temperature write for %s failed: %s",
             self.device_name,
+            entity_id,
             ex,
         )
         return False
