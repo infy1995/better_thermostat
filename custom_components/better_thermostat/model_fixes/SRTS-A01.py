@@ -8,15 +8,9 @@ from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
-from homeassistant.helpers.event import (
-    async_call_later,
-    async_track_state_change_event,
-)
-from homeassistant.util import dt as dt_util
+from homeassistant.helpers.event import async_track_state_change_event
 
-from ..utils.const import ROOM_SENSOR_FALLBACK_DELAY_S
 from ..utils.helpers import is_sibling_entry
-from ..utils.watcher import is_entity_available
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -95,45 +89,36 @@ _ON_A_REMOTE_SENSOR = ("external",)
 # The option that puts regulation back on the TRV's own sensor.
 _INTERNAL_SENSOR_OPTION = "internal"
 
-# Key under which the state listener of the room sensor is kept in
+# Key under which the state listener of the Better Thermostat entity is kept in
 # ``trv_state.extra``, so it is registered once per TRV.
 _SENSOR_WATCH_KEY = "_srts_a01_room_sensor_watch"
 
-# Key of the pending fallback timer, started when the room sensor drops out.
-_FALLBACK_TIMER_KEY = "_srts_a01_room_sensor_fallback_timer"
+# Set once the TRV has been handed back to its own sensor for the running
+# fallback, so the listener does not repeat the switch on every state write.
+_FELL_BACK_KEY = "_srts_a01_fell_back_to_internal"
 
 
-def _room_sensor_down_past_delay(self) -> bool:
-    """Report whether the room sensor has been gone for the fallback delay.
+def _room_sensor_fallback_active(self) -> bool:
+    """Report whether BT is controlling on the TRV temperature for lack of a room reading.
 
-    Mirrors ``climate.py``: BT lets the TRV's own reading stand in for the
-    room sensor only once the sensor has been unavailable for
-    ``ROOM_SENSOR_FALLBACK_DELAY_S``. Until then BT keeps the last room
-    reading, and so does this quirk, so a short dropout does not flip the
-    selector there and back.
+    The core decides this: ``room_sensor_fallback`` is set once the room
+    sensor has given no usable reading for ``ROOM_SENSOR_FALLBACK_DELAY_S``
+    (unavailable, unknown, not a number or not a plausible temperature) and
+    some TRV reports a temperature to control on. Reading it keeps the quirk
+    on the same definition and the same delay as the core.
 
     Parameters
     ----------
     self :
-        The Better Thermostat instance, supplying ``hass`` and
-        ``sensor_entity_id``.
+        The Better Thermostat instance.
 
     Returns
     -------
     bool
-        True when the room sensor is configured, is not available and has
-        been in that state for at least the fallback delay.
+        True while the core runs on the TRV temperature instead of the room
+        sensor.
     """
-    sensor_id = getattr(self, "sensor_entity_id", None)
-    if not sensor_id:
-        return False
-    if is_entity_available(self.hass, sensor_id):
-        return False
-    state = self.hass.states.get(sensor_id)
-    if state is None:
-        return True
-    down_for = (dt_util.utcnow() - state.last_changed).total_seconds()
-    return down_for >= ROOM_SENSOR_FALLBACK_DELAY_S
+    return bool(getattr(self, "room_sensor_fallback", False))
 
 
 def _find_device_entity(
@@ -366,89 +351,59 @@ async def _fall_back_to_internal(self, entity_id: str) -> None:
 
 
 def _ensure_room_sensor_watch(self, entity_id: str) -> None:
-    """Watch the room sensor and fall back to the TRV's sensor when it stays gone.
+    """Hand the TRV back to its own sensor when the core falls back to the TRV temperature.
 
-    Registered once per TRV. When the sensor stops reporting, a timer of
-    ``ROOM_SENSOR_FALLBACK_DELAY_S`` starts; if the sensor is still gone when
-    it fires, the TRV is put back on its own sensor. A sensor that returns
-    first cancels the timer. Recovery after a fallback needs no handling here,
-    because the next write of the external input selects the external sensor
-    again.
+    Registered once per TRV, on the Better Thermostat entity itself: the core
+    writes its state when it enters the fallback, which is the moment to act.
+    While the TRV regulates on the external input, ``local_temperature`` is
+    the value BT wrote, so a fallback to the TRV temperature would read that
+    value back; on the internal sensor the TRV reports what it measures.
+
+    Recovery needs no handling here: once the room sensor reports again, the
+    next write of the external input selects the external sensor first.
 
     Parameters
     ----------
     self :
-        The Better Thermostat instance, supplying ``hass``, ``sensor_entity_id``
-        and the TRV registry.
+        The Better Thermostat instance, supplying ``hass``, ``entity_id``,
+        ``room_sensor_fallback`` and the TRV registry.
     entity_id : str
         The TRV to hand back to its own sensor.
     """
-    sensor_id = getattr(self, "sensor_entity_id", None)
+    own_id = getattr(self, "entity_id", None)
     trv_state = self.real_trvs.get(entity_id)
-    if not sensor_id or trv_state is None:
+    if not own_id or trv_state is None:
         return
     if trv_state.extra.get(_SENSOR_WATCH_KEY) is not None:
         return
 
-    def _cancel_timer() -> None:
-        cancel = trv_state.extra.pop(_FALLBACK_TIMER_KEY, None)
-        if cancel is not None:
-            cancel()
-            _LOGGER.debug(
-                "better_thermostat %s: room sensor %s reports again, SRTS-A01 fallback to %s cancelled",
-                self.device_name,
-                sensor_id,
-                entity_id,
-            )
-
     @callback
-    def _fire(_now) -> None:
-        trv_state.extra.pop(_FALLBACK_TIMER_KEY, None)
-        if is_entity_available(self.hass, sensor_id):
+    def _on_bt_state_change(_event) -> None:
+        if not _room_sensor_fallback_active(self):
+            # Fallback over (or not started): arm the next one.
+            trv_state.extra.pop(_FELL_BACK_KEY, None)
             return
-        _LOGGER.debug(
-            "better_thermostat %s: SRTS-A01 fallback timer due for %s, switching to the TRV sensor now",
-            self.device_name,
-            entity_id,
-        )
+        if trv_state.extra.get(_FELL_BACK_KEY):
+            return
+        trv_state.extra[_FELL_BACK_KEY] = True
         self.hass.async_create_background_task(
             _fall_back_to_internal(self, entity_id),
             name=f"bt_srts_a01_internal_sensor_{entity_id}",
         )
 
-    @callback
-    def _on_room_sensor_change(_event) -> None:
-        if is_entity_available(self.hass, sensor_id):
-            _cancel_timer()
-            return
-        if trv_state.extra.get(_FALLBACK_TIMER_KEY) is not None:
-            return
-        trv_state.extra[_FALLBACK_TIMER_KEY] = async_call_later(
-            self.hass, ROOM_SENSOR_FALLBACK_DELAY_S, _fire
-        )
-        _LOGGER.debug(
-            "better_thermostat %s: room sensor %s unavailable, SRTS-A01 %s falls back to its own sensor in %ss unless the room sensor returns",
-            self.device_name,
-            sensor_id,
-            entity_id,
-            ROOM_SENSOR_FALLBACK_DELAY_S,
-        )
-
-    unsub_state = async_track_state_change_event(
-        self.hass, [sensor_id], _on_room_sensor_change
-    )
+    unsub = async_track_state_change_event(self.hass, [own_id], _on_bt_state_change)
 
     def _unsub_all() -> None:
-        unsub_state()
-        _cancel_timer()
+        unsub()
+        trv_state.extra.pop(_FELL_BACK_KEY, None)
 
     trv_state.extra[_SENSOR_WATCH_KEY] = _unsub_all
     on_remove = getattr(self, "async_on_remove", None)
     if callable(on_remove):
         on_remove(_unsub_all)
 
-    # The sensor may already be gone when the watch is registered.
-    _on_room_sensor_change(None)
+    # The core may already be in the fallback when the watch is registered.
+    _on_bt_state_change(None)
 
 
 async def maybe_set_external_temperature(self, entity_id, temperature: float) -> bool:
@@ -473,8 +428,9 @@ async def maybe_set_external_temperature(self, entity_id, temperature: float) ->
     -------
     bool
         True when the input was written, False when the device is not a
-        SRTS-A01, names no such input, the room sensor has been unavailable
-        for the fallback delay (the TRV is then put back on its own sensor), the value is not a number,
+        SRTS-A01, names no such input, the core runs on the TRV temperature
+        because the room sensor is gone (the TRV is then put back on its own
+        sensor), the value is not a number,
         or the device refused the write.
     """
     try:
@@ -514,14 +470,13 @@ async def maybe_set_external_temperature(self, entity_id, temperature: float) ->
 
         _ensure_room_sensor_watch(self, entity_id)
 
-        # Once the room sensor has been gone for the fallback delay, whatever
-        # BT would write here is the TRV's own stale reading handed back to
-        # it. Leave the input alone and let the TRV measure for itself until
-        # the sensor returns. Within the delay BT still holds the last room
-        # reading, which is written as usual.
-        if _room_sensor_down_past_delay(self):
+        # While the core controls on the TRV temperature for lack of a room
+        # reading, whatever BT would write here is the TRV's own stale reading
+        # handed back to it. Leave the input alone and let the TRV measure for
+        # itself until the room sensor returns.
+        if _room_sensor_fallback_active(self):
             _LOGGER.debug(
-                "better_thermostat %s: SRTS-A01 external temperature write for %s skipped, room sensor %s is gone",
+                "better_thermostat %s: SRTS-A01 external temperature write for %s skipped, core runs on the TRV temperature (room sensor %s)",
                 self.device_name,
                 entity_id,
                 getattr(self, "sensor_entity_id", None),
