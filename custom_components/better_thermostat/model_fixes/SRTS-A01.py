@@ -9,26 +9,35 @@ selector pointed at it first.
 Unlike the Sonoff TRVZB, the SRTS-A01 does not fall back to its own sensor
 when the input goes quiet: it keeps regulating on the last value written,
 and reports that value as its ``local_temperature``. Better Thermostat stops
-writing the input while the room sensor gives no reading, and controls on
-the TRV temperature instead, which on this device would be its own stale
-input read back. Better Thermostat publishes that switch as the
-``control_mode`` attribute of its climate entity, which leaves ``optimal``
-for ``sensor_fallback`` (or ``hold``). The quirk listens for that change and
-puts the selector back on ``internal``, so the device reports and regulates
-on what it measures. The next write, once the room sensor reports again,
-puts it back on ``external``.
+writing the input as soon as the room sensor gives no usable reading, and
+once that has lasted its 120-second debounce it controls on the TRV
+temperature, which on this device would be its own stale input read back.
+
+So the quirk keeps the selector in line with the room sensor configured for
+its thermostat, judging each state the way Better Thermostat does:
+
+* the room sensor gives a reading: ``external``;
+* it is unavailable, unknown, not a number or not a plausible temperature:
+  ``internal``.
+
+The selector is brought in line before every write of the input, whenever
+the room sensor changes state, and whenever the selector itself changes, so
+an option set by hand or by another automation is put back. A selector
+already in line is left alone. When the selector goes back to ``external``
+outside a write, the room reading is written into the input with it.
 
 Everything else stays as the default quirks have it.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Mapping
 import logging
+import time
 
 from homeassistant.const import (
     ATTR_UNIT_OF_MEASUREMENT,
-    EVENT_STATE_CHANGED,
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
     UnitOfTemperature,
@@ -36,6 +45,7 @@ from homeassistant.const import (
 from homeassistant.core import Event, EventStateChangedData, State, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.util.unit_conversion import TemperatureConverter
 
 from custom_components.better_thermostat.model_fixes.default import (
@@ -47,7 +57,22 @@ from custom_components.better_thermostat.model_fixes.types import (
     ModelFixHost,
     ModelQuirks,
 )
-from custom_components.better_thermostat.utils.helpers import is_sibling_entry
+from custom_components.better_thermostat.utils.const import (
+    CONF_TEMPERATURE_SENSOR,
+    CONF_THERMOSTAT,
+    DOMAIN,
+)
+from custom_components.better_thermostat.utils.helpers import (
+    convert_to_float_celsius,
+    entry_settings,
+    is_reasonable_temperature,
+    is_sibling_entry,
+    setting_str,
+)
+from custom_components.better_thermostat.utils.watcher import (
+    UNAVAILABLE_STATES,
+    UNKNOWN_STATES,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -131,26 +156,30 @@ _INTERNAL_SENSOR_OPTION = "internal"
 _EXTERNAL_TEMPERATURE_MIN_C = 0.0
 _EXTERNAL_TEMPERATURE_MAX_C = 55.0
 
-# Attributes of the Better Thermostat climate entity the quirk reads. The
-# entity publishes the rung of its control-mode ladder, the optional sensors
-# it finds unavailable, and a health entry per TRV it drives, which is how the
-# quirk tells the thermostat of its TRV from any other.
-_ATTR_CONTROL_MODE = "control_mode"
-_ATTR_UNAVAILABLE_SENSORS = "unavailable_sensors"
-_ATTR_CALIBRATOR_HEALTH = "calibrator_health"
-
-# Rungs on which Better Thermostat controls without a room reading.
-_WITHOUT_A_ROOM_READING = frozenset({"sensor_fallback", "hold"})
-
 # The listener per TRV, keyed by the TRV's climate entity id: the thermostat
 # it was registered for, and how to unsubscribe it. A reloaded thermostat is
 # a new host and registers anew.
-_FALLBACK_WATCHES: dict[str, tuple[ModelFixHost, Callable[[], None]]] = {}
+_SELECTOR_WATCHES: dict[str, tuple[ModelFixHost, Callable[[], None]]] = {}
 
-# TRVs whose switch to their own sensor is due, because the device did not
-# take it when the thermostat fell back. The next state the thermostat writes
-# during the same fallback tries again.
-_HAND_BACK_DUE: set[str] = set()
+# TRVs whose selector is being brought in line. A switch changes the selector,
+# which is itself a change the watch answers, and states can arrive in a row;
+# a change arriving meanwhile marks the TRV in ``_KEEP_AGAIN`` instead of
+# starting a second run, and the run checks once more before it ends.
+_KEEPING: set[str] = set()
+_KEEP_AGAIN: set[str] = set()
+
+# One check at a time per TRV. A write by Better Thermostat and a change of
+# the room sensor arrive together when the sensor comes back, and two checks
+# side by side would both find the old option and both switch.
+_SELECTOR_LOCKS: dict[str, asyncio.Lock] = {}
+
+# The option last sent to each TRV's selector, and when. The device confirms a
+# switch seconds later, and until it does the selector still reports the old
+# option; a check in between waits for the confirmation instead of sending the
+# switch again. One that has not arrived after ``_SWITCH_CONFIRM_S`` counts as
+# lost, and the next check sends the switch again.
+_PENDING_SWITCHES: dict[str, tuple[str, float]] = {}
+_SWITCH_CONFIRM_S = 30.0
 
 
 def _find_device_entity(
@@ -282,169 +311,350 @@ async def _select_sensor(
     return True
 
 
-async def maybe_select_external_sensor(self: ModelFixHost, entity_id: str) -> bool:
-    """Point the TRV's sensor selector at the value BT writes.
+def _room_sensor_of(self: ModelFixHost, entity_id: str) -> str | None:
+    """Return the room temperature sensor of the thermostat driving ``entity_id``.
 
-    Writing the external temperature input achieves nothing while the device
-    regulates on its own sensor, and it lands there on its own: a SRTS-A01
-    that is re-paired comes back on the internal sensor, and the fallback
-    watch puts it there while the room sensor is gone. So the selector is
-    checked alongside every write of the input it belongs to.
+    Read from the Better Thermostat config entry that lists the TRV among
+    its thermostats, where the room sensor is kept as ``temperature_sensor``.
+
+    Parameters
+    ----------
+    self : ModelFixHost
+        The Better Thermostat instance, supplying ``hass``.
+    entity_id : str
+        The TRV whose thermostat is looked up.
 
     Returns
     -------
-    bool
-        True when the selector is on ``external``.
+    str | None
+        The entity id of the room sensor, or ``None`` when no config entry
+        lists the TRV or the one that does names no sensor.
     """
+    for entry in self.hass.config_entries.async_entries(DOMAIN):
+        settings = entry_settings(entry)
+        thermostats = settings.get(CONF_THERMOSTAT)
+        if not isinstance(thermostats, (list, tuple)):
+            continue
+        if any(
+            isinstance(trv, Mapping) and trv.get("trv") == entity_id
+            for trv in thermostats
+        ):
+            return setting_str(settings, CONF_TEMPERATURE_SENSOR)
+    return None
+
+
+def _room_reading(self: ModelFixHost, state: State | None) -> float | None:
+    """Return the room temperature ``state`` carries, as Better Thermostat reads it.
+
+    The same judgement the thermostat makes before it controls on a room
+    sensor: a missing, unavailable or unknown state, one that is no number
+    and one outside the plausible range all carry no reading.
+    """
+    if state is None or state.state in UNAVAILABLE_STATES + UNKNOWN_STATES:
+        return None
+    unit = state.attributes.get(ATTR_UNIT_OF_MEASUREMENT)
+    value = convert_to_float_celsius(
+        state.state,
+        self.device_name,
+        "SRTS-A01 room sensor",
+        unit_of_measurement=unit if isinstance(unit, str) else None,
+    )
+    return value if is_reasonable_temperature(value) else None
+
+
+def _wanted_option(room_sensor: str | None, reading: float | None) -> str:
+    """Return the selector option the room sensor calls for.
+
+    ``external`` while the room sensor gives a reading, ``internal`` while it
+    gives none. A TRV whose thermostat names no room sensor keeps reading the
+    input BT writes.
+    """
+    if room_sensor is not None and reading is None:
+        return _INTERNAL_SENSOR_OPTION
+    return _EXTERNAL_SENSOR_OPTION
+
+
+async def _keep_selector(self: ModelFixHost, entity_id: str) -> str | None:
+    """Bring the TRV's sensor selector in line with its room sensor.
+
+    Parameters
+    ----------
+    self : ModelFixHost
+        The Better Thermostat instance, supplying ``hass`` and the context
+        the service call is made under.
+    entity_id : str
+        The TRV whose device carries the selector.
+
+    Returns
+    -------
+    str | None
+        The option the selector was switched to, or ``None`` when it was
+        already in line, a switch to it awaits the device's confirmation,
+        the device has no selector or the selector is not reporting.
+    """
+    lock = _SELECTOR_LOCKS.setdefault(entity_id, asyncio.Lock())
+    async with lock:
+        return await _keep_selector_now(self, entity_id)
+
+
+async def _keep_selector_now(self: ModelFixHost, entity_id: str) -> str | None:
+    """Run one check of ``_keep_selector`` under the TRV's lock."""
     selector = _sensor_selector(self, entity_id)
     if selector is None:
         _LOGGER.debug(
-            "better_thermostat %s: SRTS-A01 sensor selector not found for %s",
+            "better_thermostat %s: SRTS-A01 %s has no sensor selector to keep",
             self.device_name,
             entity_id,
         )
-        return False
-    return await _select_sensor(self, entity_id, selector, _EXTERNAL_SENSOR_OPTION)
-
-
-def _drives(state: State, entity_id: str) -> bool:
-    """Whether ``state`` is the Better Thermostat climate entity driving ``entity_id``."""
-    if state.domain != "climate":
-        return False
-    health = state.attributes.get(_ATTR_CALIBRATOR_HEALTH)
-    return isinstance(health, Mapping) and entity_id in health
-
-
-def _without_a_room_reading(state: State | None) -> bool:
-    """Whether the thermostat in ``state`` controls without a room reading."""
-    if state is None:
-        return False
-    return state.attributes.get(_ATTR_CONTROL_MODE) in _WITHOUT_A_ROOM_READING
-
-
-def _unavailable_sensors(state: State) -> frozenset[str]:
-    """Return the optional sensors the thermostat in ``state`` finds unavailable."""
-    sensors = state.attributes.get(_ATTR_UNAVAILABLE_SENSORS)
-    if not isinstance(sensors, (list, tuple)):
-        return frozenset()
-    return frozenset(str(sensor) for sensor in sensors)
-
-
-def _falls_back(old: State | None, new: State) -> bool:
-    """Whether the change from ``old`` to ``new`` takes the room reading away.
-
-    The ladder leaving ``optimal`` is the main case. A thermostat already
-    below it may still be waiting out its recovery window after the sensor
-    returned, while the writes have put the device back on the input, so a
-    sensor going unavailable again during that window counts as well.
-    """
-    if not _without_a_room_reading(new):
-        return False
-    if old is None or not _without_a_room_reading(old):
-        return True
-    return bool(_unavailable_sensors(new) - _unavailable_sensors(old))
-
-
-async def _hand_back(self: ModelFixHost, entity_id: str) -> None:
-    """Put the TRV back on its own sensor, marking the switch due if it fails."""
-    if self.is_removed:
-        return
-    selector = _sensor_selector(self, entity_id)
-    if selector is None:
-        _HAND_BACK_DUE.discard(entity_id)
-        return
-    try:
-        switched = await _select_sensor(
-            self, entity_id, selector, _INTERNAL_SENSOR_OPTION
+        return None
+    room_sensor = _room_sensor_of(self, entity_id)
+    room_state = self.hass.states.get(room_sensor) if room_sensor else None
+    reading = _room_reading(self, room_state)
+    wanted = _wanted_option(room_sensor, reading)
+    state = self.hass.states.get(selector)
+    current = state.state if state is not None else None
+    pending = _PENDING_SWITCHES.get(entity_id)
+    now = time.monotonic()
+    if current == wanted:
+        _PENDING_SWITCHES.pop(entity_id, None)
+        outcome = "left as it is"
+    elif (
+        pending is not None
+        and pending[0] == wanted
+        and now - pending[1] < _SWITCH_CONFIRM_S
+    ):
+        outcome = (
+            f"switch sent {now - pending[1]:.0f} s ago, waiting for the device "
+            "to confirm it"
         )
+    else:
+        outcome = "switching"
+    _LOGGER.debug(
+        "better_thermostat %s: SRTS-A01 %s check: room sensor %s is '%s' "
+        "(reading %s), selector %s is '%s', wants '%s': %s",
+        self.device_name,
+        entity_id,
+        room_sensor,
+        room_state.state if room_state is not None else None,
+        f"{reading:.2f}" if reading is not None else "none",
+        selector,
+        current,
+        wanted,
+        outcome,
+    )
+    if outcome != "switching":
+        return None
+    if not await _select_sensor(self, entity_id, selector, wanted):
+        _LOGGER.debug(
+            "better_thermostat %s: SRTS-A01 %s selector %s not set to '%s' now "
+            "(not reporting or no such option); the next change tries again",
+            self.device_name,
+            entity_id,
+            selector,
+            wanted,
+        )
+        return None
+    _PENDING_SWITCHES[entity_id] = (wanted, time.monotonic())
+    if wanted == _INTERNAL_SENSOR_OPTION:
+        _LOGGER.info(
+            "better_thermostat %s: room temperature sensor %s gives no usable "
+            "reading, SRTS-A01 %s regulates on its own sensor until it reports again",
+            self.device_name,
+            room_sensor,
+            entity_id,
+        )
+    else:
+        _LOGGER.info(
+            "better_thermostat %s: room temperature sensor %s gives a reading, "
+            "SRTS-A01 %s regulates on the room temperature",
+            self.device_name,
+            room_sensor,
+            entity_id,
+        )
+    return wanted
+
+
+async def _keep_selector_once(self: ModelFixHost, entity_id: str) -> None:
+    """Bring the selector in line outside a write, reporting a refused switch.
+
+    Put back on ``external``, the device is handed the room reading right
+    away rather than at the next write, which can be half an hour off.
+    """
+    try:
+        switched = await _keep_selector(self, entity_id)
+        if switched != _EXTERNAL_SENSOR_OPTION:
+            return
+        room_sensor = _room_sensor_of(self, entity_id)
+        if room_sensor is None:
+            return
+        reading = _room_reading(self, self.hass.states.get(room_sensor))
+        target = _input_number(self, entity_id)
+        if reading is not None and target is not None:
+            await _write_input(self, entity_id, target, reading)
     except (HomeAssistantError, OSError, TypeError, ValueError, KeyError) as ex:
+        # The device is asleep or out of reach. The next change of the room
+        # sensor or the selector, or the next write, tries again.
         _LOGGER.warning(
-            "better_thermostat %s: SRTS-A01 switch of %s to its own sensor failed: %s",
+            "better_thermostat %s: SRTS-A01 sensor selector of %s not set: %s",
             self.device_name,
             entity_id,
             ex,
         )
-        switched = False
-    if not switched:
-        # The device is asleep or out of reach; the switch is due all the same.
-        _HAND_BACK_DUE.add(entity_id)
+
+
+async def _keep_selector_until_settled(self: ModelFixHost, entity_id: str) -> None:
+    """Run ``_keep_selector_once`` until no change arrived during the run."""
+    try:
+        while not self.is_removed:
+            _KEEP_AGAIN.discard(entity_id)
+            await _keep_selector_once(self, entity_id)
+            if entity_id not in _KEEP_AGAIN:
+                return
+    finally:
+        _KEEPING.discard(entity_id)
+        _KEEP_AGAIN.discard(entity_id)
+
+
+def _start_keeping(self: ModelFixHost, entity_id: str) -> None:
+    """Bring the selector in line under the thermostat's task manager."""
+    if entity_id in _KEEPING:
+        _KEEP_AGAIN.add(entity_id)
         return
-    _HAND_BACK_DUE.discard(entity_id)
-    _LOGGER.info(
-        "better_thermostat %s: controls without a room reading, SRTS-A01 %s "
-        "regulates on its own sensor until the room sensor reports again",
-        self.device_name,
-        entity_id,
+    # Marked before the task exists: Home Assistant may start it eagerly, and
+    # a run that finishes within that start clears the mark itself.
+    _KEEPING.add(entity_id)
+    task = self.task_manager.create_task(
+        _keep_selector_until_settled(self, entity_id),
+        name=f"bt_srts_a01_sensor_selector_{entity_id}",
     )
-
-
-def _start_hand_back(self: ModelFixHost, entity_id: str) -> None:
-    """Run the switch to the TRV's own sensor under the thermostat's task manager."""
-    _HAND_BACK_DUE.discard(entity_id)
-    self.task_manager.create_task(
-        _hand_back(self, entity_id), name=f"bt_srts_a01_internal_sensor_{entity_id}"
-    )
+    if task is None:
+        # The thermostat is being removed and started nothing.
+        _KEEPING.discard(entity_id)
 
 
 def _stop_watching(self: ModelFixHost, entity_id: str) -> None:
-    """Unsubscribe the fallback watch ``self`` registered for the TRV."""
-    existing = _FALLBACK_WATCHES.get(entity_id)
+    """Unsubscribe the selector watch ``self`` registered for the TRV."""
+    existing = _SELECTOR_WATCHES.get(entity_id)
     if existing is not None and existing[0] is self:
-        del _FALLBACK_WATCHES[entity_id]
-        _HAND_BACK_DUE.discard(entity_id)
+        del _SELECTOR_WATCHES[entity_id]
         existing[1]()
 
 
-def _watch_for_fallback(self: ModelFixHost, entity_id: str) -> None:
-    """Listen for the thermostat of the TRV to lose its room reading.
+def _watch_selector(self: ModelFixHost, entity_id: str) -> None:
+    """Keep the selector in line whenever the room sensor or the selector changes.
 
-    Registered once per TRV and thermostat. The listener watches every state
-    change and keeps the ones of the Better Thermostat entity that names the
-    TRV among its own; the quirk is handed no entity id of the thermostat.
+    Registered once per TRV and thermostat. The room sensor changing calls
+    for the other option; the selector changing, by hand or by another
+    automation, is put back to the option the room sensor calls for.
     """
-    existing = _FALLBACK_WATCHES.get(entity_id)
+    existing = _SELECTOR_WATCHES.get(entity_id)
     if existing is not None:
         if existing[0] is self:
             return
         # A thermostat that was reloaded leaves the listener of its old self.
         existing[1]()
+        del _SELECTOR_WATCHES[entity_id]
+    room_sensor = _room_sensor_of(self, entity_id)
+    if room_sensor is None:
+        _LOGGER.debug(
+            "better_thermostat %s: SRTS-A01 no room temperature sensor configured "
+            "for %s, its selector is kept on '%s'",
+            self.device_name,
+            entity_id,
+            _EXTERNAL_SENSOR_OPTION,
+        )
+    watched = [
+        watched_id
+        for watched_id in (room_sensor, _sensor_selector(self, entity_id))
+        if watched_id is not None
+    ]
+    if not watched:
+        return
 
     @callback
-    def _on_state_changed(event: Event[EventStateChangedData]) -> None:
+    def _on_change(event: Event[EventStateChangedData]) -> None:
         if self.is_removed:
             _stop_watching(self, entity_id)
             return
         new_state = event.data["new_state"]
-        if new_state is None or not _drives(new_state, entity_id):
-            return
-        if not _without_a_room_reading(new_state):
-            _HAND_BACK_DUE.discard(entity_id)
-            return
-        if entity_id in _HAND_BACK_DUE or _falls_back(
-            event.data["old_state"], new_state
-        ):
-            _start_hand_back(self, entity_id)
+        _LOGGER.debug(
+            "better_thermostat %s: SRTS-A01 %s changed to '%s', checking the "
+            "sensor selector of %s",
+            self.device_name,
+            event.data["entity_id"],
+            new_state.state if new_state is not None else None,
+            entity_id,
+        )
+        _start_keeping(self, entity_id)
 
-    unsubscribe = self.hass.bus.async_listen(EVENT_STATE_CHANGED, _on_state_changed)
-    _FALLBACK_WATCHES[entity_id] = (self, unsubscribe)
+    unsubscribe = async_track_state_change_event(self.hass, watched, _on_change)
+    _SELECTOR_WATCHES[entity_id] = (self, unsubscribe)
+    _LOGGER.debug(
+        "better_thermostat %s: SRTS-A01 watching %s to keep the sensor selector "
+        "of %s in line",
+        self.device_name,
+        ", ".join(watched),
+        entity_id,
+    )
 
 
 async def initial_tweak(self: ModelFixHost, entity_id: str) -> None:
-    """Run the default tweaks and start the fallback watch.
+    """Run the default tweaks, bring the selector in line and start watching it.
 
     A room sensor that gives no reading from startup on leaves the input
-    without a single write, so the watch starts here rather than with the
-    first one. A thermostat that already controls without a room reading
-    has its TRV handed back right away: the change into that state may have
-    been written before the watch existed.
+    without a single write, so the selector is brought in line here as well.
     """
     await default_initial_tweak(self, entity_id)
-    _watch_for_fallback(self, entity_id)
-    if any(
-        _drives(state, entity_id) and _without_a_room_reading(state)
-        for state in self.hass.states.async_all("climate")
-    ):
-        _start_hand_back(self, entity_id)
+    _watch_selector(self, entity_id)
+    await _keep_selector_once(self, entity_id)
+
+
+def _input_number(self: ModelFixHost, entity_id: str) -> str | None:
+    """Return the ``external_temperature_input`` number on the TRV's device."""
+    entity_registry = er.async_get(self.hass)
+    reg_entity = entity_registry.async_get(entity_id)
+    if reg_entity is None:
+        _LOGGER.debug(
+            "better_thermostat %s: SRTS-A01 no registry entity for %s",
+            self.device_name,
+            entity_id,
+        )
+        return None
+    target = _find_device_entity(
+        entity_registry,
+        reg_entity.device_id,
+        "number",
+        _TK_EXTERNAL_TEMP,
+        "external_temperature_input",
+    )
+    if target is None:
+        _LOGGER.debug(
+            "better_thermostat %s: SRTS-A01 external_temperature_input number entity not found for %s",
+            self.device_name,
+            entity_id,
+        )
+    return target
+
+
+async def _write_input(
+    self: ModelFixHost, entity_id: str, target: str, celsius: float
+) -> None:
+    """Write ``celsius`` into the external temperature input ``target``."""
+    value = _external_input_value(self.hass.states.get(target), celsius)
+    await self.hass.services.async_call(
+        "number",
+        "set_value",
+        {"entity_id": target, "value": value},
+        blocking=True,
+        context=self.context,
+    )
+    _LOGGER.debug(
+        "better_thermostat %s: set SRTS-A01 external_temperature_input=%.2f on %s (for %s)",
+        self.device_name,
+        value,
+        target,
+        entity_id,
+    )
 
 
 def _external_input_value(state: State | None, celsius: float) -> float:
@@ -499,9 +709,9 @@ async def maybe_set_external_temperature(
     Looks for the number entity matching ``external_temperature_input`` on
     the TRV's device and writes the temperature, rounded to a tenth of a
     degree Celsius, converted into the unit the input publishes and held
-    inside the range it publishes. The sensor selector is pointed at that
-    input first, because a device regulating on its own sensor never reads
-    it and may discard a value written to it.
+    inside the range it publishes. The sensor selector is brought in line
+    with the room sensor first, because a device regulating on its own
+    sensor never reads the input and may discard a value written to it.
 
     Parameters
     ----------
@@ -529,28 +739,8 @@ async def maybe_set_external_temperature(
                 model,
             )
             return False
-        entity_registry = er.async_get(self.hass)
-        reg_entity = entity_registry.async_get(entity_id)
-        if reg_entity is None:
-            _LOGGER.debug(
-                "better_thermostat %s: SRTS-A01 maybe_set_external_temperature: no registry entity for %s",
-                self.device_name,
-                entity_id,
-            )
-            return False
-        target = _find_device_entity(
-            entity_registry,
-            reg_entity.device_id,
-            "number",
-            _TK_EXTERNAL_TEMP,
-            "external_temperature_input",
-        )
+        target = _input_number(self, entity_id)
         if target is None:
-            _LOGGER.debug(
-                "better_thermostat %s: SRTS-A01 external_temperature_input number entity not found for %s",
-                self.device_name,
-                entity_id,
-            )
             return False
 
         try:
@@ -563,31 +753,13 @@ async def maybe_set_external_temperature(
             )
             return False
 
-        # The room sensor reports again, so no switch to the device's own
-        # sensor is due any more.
-        _watch_for_fallback(self, entity_id)
-        _HAND_BACK_DUE.discard(entity_id)
-
-        value = _external_input_value(self.hass.states.get(target), celsius)
+        _watch_selector(self, entity_id)
 
         # The selector goes first: a device on its internal sensor can discard
         # the input, so a value written before the switch may never be used.
-        await maybe_select_external_sensor(self, entity_id)
+        await _keep_selector(self, entity_id)
 
-        await self.hass.services.async_call(
-            "number",
-            "set_value",
-            {"entity_id": target, "value": value},
-            blocking=True,
-            context=self.context,
-        )
-        _LOGGER.debug(
-            "better_thermostat %s: set SRTS-A01 external_temperature_input=%.2f on %s (for %s)",
-            self.device_name,
-            value,
-            target,
-            entity_id,
-        )
+        await _write_input(self, entity_id, target, celsius)
         return True
     except (
         HomeAssistantError,
